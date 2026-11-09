@@ -1,0 +1,9 @@
+# 统一用 LF 换行，Windows 上检出也保持 LF。
+* text=auto eol=lf
+
+*.png binary
+*.otf binary
+
+# 测试和样例数据不进安装包（AstrBot 按仓库压缩包安装）
+tests/ export-ignore
+scripts/ export-ignore

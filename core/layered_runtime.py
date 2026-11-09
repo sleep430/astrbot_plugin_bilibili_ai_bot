@@ -1,31 +1,38 @@
-"""Runtime wiring for the new adapter/security/storage/persona layers.
+"""Runtime wiring for the new adapter/security/storage layers.
 
 The established :mod:`core.runtime` remains the low-latency dispatcher used by
 comments, private messages and live danmaku.  This module is its persistent
 observer: it adds cross-restart event/action idempotency, namespaced identities,
-auditing and persona/profile state without changing platform reply behaviour.
+auditing and profile state without changing platform reply behaviour.
 """
 
 from __future__ import annotations
 
 import json
 import time
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Iterable
 
-from .adapter.events import EventAdapter, EventState as StoredEventState
-from .adapter.events import InboundEvent as StoredInboundEvent
+from .storage.event_log import EventAdapter, StoredEventState, StoredInboundEvent
 from .behavior_budget import BehaviorBudget
-from .persona import PersonaEngine
 from .runtime import ActionRequest, ActionState, EventState, InboundEvent
 from .security import (
+    CapabilityError,
     CapabilityStore,
+    Caller,
+    Decision,
     IdentityResolver,
     PendingConfirmations,
+    Role,
+    Scope,
     SessionKey,
     ToolGate,
     ToolSpec,
     Tier,
+    build_digest,
+    cancel_from_message,
+    confirm_from_message,
     scope_for_source,
 )
 from .storage import (
@@ -36,10 +43,19 @@ from .storage import (
 
 _WRITE_TOOLS = {
     "bili_action",
-    "bili_parse_video",
+    "bili_block_user",
+    "bili_watch_videos",
     "watch_and_share_video_private",
+    # Legacy/direct names remain closed if they are registered again.
+    "post_comment",
+    "like_video",
+    "coin_video",
+    "fav_video",
+    "follow_up",
+    "bili_watch_bangumi",
 }
 _PRIVATE_READ_TOOLS = {
+    "bili_recall",
     "recall_user",
     "recall_conversation",
     "recall_today",
@@ -48,8 +64,26 @@ _PRIVATE_READ_TOOLS = {
     "recall_bangumi",
     "check_following_updates",
     "check_following_live",
-    "watch_video",
+    "get_bangumi_updates",
 }
+_PUBLIC_READ_TOOLS = {
+    "bili_parse_video",
+    # Watching analyzes a public video and only reads the bot's own video
+    # memories; it never touches account-private data, so QQ groups may use it.
+    "watch_video",
+    "search_bilibili",
+    "bili_bangumi",
+    "get_up_info",
+    "search_bangumi",
+    "get_bangumi_info",
+    "get_bangumi_trending",
+    "get_bangumi_timeline",
+}
+# 改 Bot 自己的画像、记忆：只给管理员，且只在可信通道
+_PERSONA_ADMIN_TOOLS = {
+    "bili_owner_feedback",
+}
+_QQ_PLATFORMS = {"aiocqhttp", "qq", "qqofficial", "napcat", "onebot"}
 
 
 class LayeredRuntime:
@@ -66,7 +100,6 @@ class LayeredRuntime:
         self.feedback = FeedbackStore(self.db)
         self.preferences = PreferenceStore(self.db)
         self.media = MediaStore(self.db)
-        self.persona = PersonaEngine(self.db, self._get)
         self.capabilities = CapabilityStore(self.db)
         self.pending_confirmations = PendingConfirmations(self.db)
         self.tool_gate = ToolGate(self._get, audit=self._audit)
@@ -87,9 +120,6 @@ class LayeredRuntime:
     async def open(self) -> None:
         await self.db.open()
         await self._recover_interrupted_actions()
-        # Create the initial state eagerly so WebUI never has to guess whether the
-        # persona layer exists. Day-plan generation remains lazy and side-effect free.
-        await self.persona.snapshot()
 
     async def _recover_interrupted_actions(self) -> None:
         """Resolve queue state left by an unclean plugin stop.
@@ -133,7 +163,13 @@ class LayeredRuntime:
         await self.db.close()
 
     def register_tools(self, tools: Iterable[Any]) -> None:
-        """Mirror AstrBot FunctionTools into the declarative security catalogue."""
+        """Mirror known AstrBot FunctionTools into the security catalogue.
+
+        Unknown tools are deliberately not registered as public reads. A newly added
+        tool must be classified explicitly before the execution guard can allow it.
+        Composite tools receive a conservative base tier here and are re-classified
+        per subaction in :meth:`tool_spec_for_call`.
+        """
 
         for tool in tools:
             name = str(getattr(tool, "name", "") or "").strip()
@@ -143,8 +179,12 @@ class LayeredRuntime:
                 tier, read_only, needs_capability = Tier.WRITE, False, True
             elif name in _PRIVATE_READ_TOOLS:
                 tier, read_only, needs_capability = Tier.PRIVATE_READ, True, False
-            else:
+            elif name in _PUBLIC_READ_TOOLS:
                 tier, read_only, needs_capability = Tier.PUBLIC_READ, True, False
+            elif name in _PERSONA_ADMIN_TOOLS:
+                tier, read_only, needs_capability = Tier.PERSONA_ADMIN, True, False
+            else:
+                continue
             self.tool_gate.register(
                 ToolSpec(
                     name=name,
@@ -156,6 +196,183 @@ class LayeredRuntime:
                     needs_capability=needs_capability,
                 )
             )
+
+    @staticmethod
+    def _tool_context_event(context: Any) -> Any | None:
+        return getattr(getattr(context, "context", None), "event", None)
+
+    @staticmethod
+    def _event_value(event: Any, name: str, default: Any = "") -> Any:
+        try:
+            value = getattr(event, name, default)
+            return value() if callable(value) else value
+        except Exception:
+            return default
+
+    def caller_from_tool_context(self, context: Any) -> Caller | None:
+        """Resolve a trusted QQ caller from the real AstrBot tool context.
+
+        Tool arguments and message text never participate in identity resolution.
+        Unknown platforms, unknown scenes and missing senders fail closed.
+        """
+
+        event = self._tool_context_event(context)
+        if event is None:
+            return None
+        origin = str(getattr(event, "unified_msg_origin", "") or "")
+        origin_parts = origin.split(":")
+        platform = str(
+            self._event_value(event, "get_platform_name", "")
+            or (origin_parts[0] if origin_parts else "")
+        ).strip().lower()
+        if platform not in _QQ_PLATFORMS:
+            return None
+        sender = str(self._event_value(event, "get_sender_id", "") or "").strip()
+        if not sender:
+            return None
+
+        message_type = self._event_value(event, "get_message_type", "")
+        kind = str(
+            getattr(message_type, "value", "")
+            or getattr(message_type, "name", "")
+            or message_type
+            or (origin_parts[1] if len(origin_parts) > 1 else "")
+        ).lower()
+        group_id = str(self._event_value(event, "get_group_id", "") or "").strip()
+        origin_session = origin_parts[2].strip() if len(origin_parts) > 2 else ""
+        if "group" in kind or group_id:
+            channel = group_id or origin_session
+            if not channel:
+                return None
+            scope = Scope.QQ_GROUP
+            session_key = f"group:{channel}"
+        elif "friend" in kind or "private" in kind:
+            scope = Scope.QQ_PRIVATE
+            session_key = f"user:{sender}"
+        else:
+            return None
+
+        account_id = str(self._get("DEDE_USER_ID", "") or "default").strip()
+        caller = self.identity.resolve(
+            "qq",
+            sender,
+            scope,
+            display_name=str(self._event_value(event, "get_sender_name", "") or ""),
+            account_id=account_id or "default",
+            session_id=SessionKey(scope, session_key, account_id or "default").render(),
+        )
+        # AstrBot's platform role is trusted; a QQ group still remains a
+        # non-admin scope, so this elevation cannot unlock writes there.
+        if bool(self._event_value(event, "is_admin", False)):
+            caller = replace(caller, role=Role.ADMIN)
+        return caller
+
+    def tool_spec_for_call(self, name: str, kwargs: dict[str, Any]) -> ToolSpec | None:
+        base = self.tool_gate.get(name)
+        if base is None:
+            return None
+        tier = base.tier
+        if name == "search_bilibili":
+            search_type = str(kwargs.get("search_type", "video") or "video").strip().lower()
+            if search_type in {"following_updates", "following_live"}:
+                tier = Tier.PRIVATE_READ
+        elif name == "bili_bangumi":
+            # Match the composite tool's execution normalization before classifying.
+            action = str(kwargs.get("action", "") or "").strip().lower()
+            if action == "updates":
+                tier = Tier.PRIVATE_READ
+            elif action == "watch":
+                tier = Tier.WRITE
+        if tier is base.tier:
+            return base
+        return replace(
+            base,
+            tier=tier,
+            read_only=tier is not Tier.WRITE,
+            needs_capability=tier is Tier.WRITE,
+        )
+
+    async def authorize_tool_call(
+        self, name: str, context: Any, kwargs: dict[str, Any]
+    ) -> Decision:
+        """Authorize the actual FunctionTool execution, including confirmation."""
+
+        name = str(name or "").strip()
+        event = self._tool_context_event(context)
+        if event is None:
+            return Decision(False, "无法确认真实调用者，工具调用已拒绝")
+        caller = self.caller_from_tool_context(context)
+        if caller is None:
+            origin = str(getattr(event, "unified_msg_origin", "") or "")
+            platform = str(
+                self._event_value(event, "get_platform_name", "")
+                or origin.split(":", 1)[0]
+            ).strip().lower()
+            if platform and platform not in _QQ_PLATFORMS:
+                return Decision(False, "不支持的调用平台，工具调用已拒绝")
+            return Decision(False, "无法确认真实调用者或会话，工具调用已拒绝")
+
+        async def deny(reason: str) -> Decision:
+            await self.tool_gate.audit(
+                "tool_call", caller, name, "deny", reason
+            )
+            return Decision(False, reason)
+
+        spec = self.tool_spec_for_call(name, dict(kwargs or {}))
+        if spec is None:
+            return await deny("工具未声明安全级别，已默认拒绝")
+        decision = self.tool_gate.authorize(spec, caller)
+        if not decision.allowed:
+            return await deny(decision.reason)
+        if spec.tier is not Tier.WRITE:
+            return Decision(True)
+        if not self.is_open:
+            return await deny("授权服务未启动，写操作已拒绝")
+
+        args = dict(kwargs or {})
+        target = next(
+            (
+                args[key]
+                for key in ("target", "uid", "oid", "bvid", "season_id", "query", "keyword")
+                if args.get(key) not in (None, "")
+            ),
+            "",
+        )
+        digest = build_digest(name, caller, target=str(target), args=args)
+        raw_message = str(getattr(event, "message_str", "") or "")
+        try:
+            if cancel_from_message(raw_message):
+                pending = await self.pending_confirmations.take(caller.session_id)
+                await self.tool_gate.audit(
+                    "tool_call", caller, name, "cancel", digest.digest
+                )
+                return Decision(
+                    False, "已取消待确认写操作。" if pending else "没有待确认的写操作。"
+                )
+            if confirm_from_message(raw_message):
+                pending = await self.pending_confirmations.take(caller.session_id)
+                if pending is None:
+                    return await deny("没有待确认的写操作，请重新发起")
+                if pending.digest != digest.digest:
+                    return await deny("待确认写操作与本次工具或参数不一致，请重新发起")
+                capability = await self.capabilities.issue(
+                    digest, caller, confirmed_message=raw_message
+                )
+                await self.capabilities.consume(capability.token, digest)
+                await self.tool_gate.audit(
+                    "tool_call", caller, name, "allow", digest.digest
+                )
+                return Decision(True)
+
+            await self.pending_confirmations.put(digest)
+            await self.tool_gate.audit(
+                "tool_call", caller, name, "confirm_required", digest.digest
+            )
+            return Decision(False, digest.render())
+        except CapabilityError as exc:
+            return await deny(str(exc))
+        except Exception:
+            return await deny("授权服务暂不可用，写操作已拒绝")
 
     async def _audit(
         self,
@@ -322,8 +539,6 @@ class LayeredRuntime:
             reason=reason,
             error=reason if target is StoredEventState.FAILED else "",
         )
-        if target is StoredEventState.SENT:
-            await self.persona.consume_reply()
 
     async def before_action(
         self, request: ActionRequest
@@ -408,11 +623,13 @@ class LayeredRuntime:
         )
 
     async def on_action_finished(
-        self, request: ActionRequest, state: ActionState | str, reason: str = ""
+        self, request: ActionRequest, state: ActionState | str, reason: str = "", value: Any = None
     ) -> None:
         if not self.is_open:
             return
         normalized = state.value if isinstance(state, ActionState) else str(state)
+        if normalized == ActionState.SUCCEEDED.value and getattr(value, "rpid", 0):
+            await self._remember_own_comment(request, value)
 
         def _finish(conn):
             at = now()
@@ -445,7 +662,6 @@ class LayeredRuntime:
     async def snapshot(self) -> dict[str, Any]:
         if not self.is_open:
             return {"open": False}
-        persona = await self.persona.snapshot()
         action_rows = await self.db.fetch_all(
             "SELECT state,COUNT(*) AS count FROM actions GROUP BY state"
         )
@@ -462,12 +678,6 @@ class LayeredRuntime:
             "events": await self.events.stats(),
             "tables": await self.db.table_counts(),
             "database_bytes": await self.db.db_size_bytes(),
-            "persona": {
-                "energy": round(float(persona.energy) * 100),
-                "social": round(float(persona.social) * 100),
-                "mood": persona.mood,
-                "phase": persona.phase,
-            },
             "behavior": {
                 "action_states": action_states,
                 "current_counters": [dict(row) for row in counter_rows],
@@ -491,6 +701,57 @@ class LayeredRuntime:
         )
         return [dict(row) for row in rows]
 
+    async def actions_between(
+        self, kinds: Iterable[str], start: float, end: float
+    ) -> list[dict[str, Any]]:
+        """``[start, end)`` 里登记过的这几种写动作，旧的在前（WebUI「今天」页用）。"""
+        kinds = list(kinds)
+        if not self.is_open or not kinds:
+            return []
+        marks = ",".join("?" * len(kinds))
+        rows = await self.db.fetch_all(
+            "SELECT key,kind,target_id,state,digest,created_at FROM actions "
+            f"WHERE kind IN ({marks}) AND created_at>=? AND created_at<? ORDER BY created_at",
+            (*kinds, float(start), float(end)),
+        )
+        return [dict(row) for row in rows]
+
+    async def _remember_own_comment(self, request: ActionRequest, posted: Any) -> None:
+        """发成了的评论记下 rpid（``BiliComments`` 回的 ``PostedComment``），WebUI 删评论按它找。"""
+        await self.db.execute(
+            "INSERT OR IGNORE INTO own_comments(rpid,oid,type,action_key,kind,text,created_at) "
+            "VALUES(?,?,?,?,?,?,?)",
+            (str(posted.rpid), str(posted.oid), int(posted.type), request.key, request.kind,
+             str(getattr(posted, "text", "") or "")[:200], now()),
+        )
+
+    async def own_comments(
+        self, *, rpids: Iterable[str] = (), action_keys: Iterable[str] = ()
+    ) -> dict[str, dict[str, Any]]:
+        """按 rpid 或动作 key 查自己发的评论，返回 ``{rpid: 行}``。"""
+        rpids, action_keys = [str(r) for r in rpids if r], [str(k) for k in action_keys if k]
+        if not self.is_open or not (rpids or action_keys):
+            return {}
+        where, params = [], []
+        if rpids:
+            where.append(f"rpid IN ({','.join('?' * len(rpids))})")
+            params += rpids
+        if action_keys:
+            where.append(f"action_key IN ({','.join('?' * len(action_keys))})")
+            params += action_keys
+        rows = await self.db.fetch_all(f"SELECT * FROM own_comments WHERE {' OR '.join(where)}", params)
+        return {str(row["rpid"]): dict(row) for row in rows}
+
+    async def mark_own_comment_deleted(self, rpid: str, state: str) -> None:
+        """记下删评论的结果；删成了才写 ``deleted_at``，行不抹掉。"""
+        if not self.is_open:
+            return
+        await self.db.execute(
+            "UPDATE own_comments SET delete_state=?,"
+            "deleted_at=CASE WHEN ?='succeeded' THEN ? ELSE deleted_at END WHERE rpid=?",
+            (str(state), str(state), now(), str(rpid)),
+        )
+
     async def security_stats(self) -> dict[str, Any]:
         if not self.is_open:
             return {"today_total": 0, "by_type": {}}
@@ -504,12 +765,16 @@ class LayeredRuntime:
 
     async def purge_expired(self) -> dict[str, int]:
         if not self.is_open:
-            return {"memories": 0, "profile_facts": 0, "media": 0, "counters": 0}
+            return {"memories": 0, "profile_facts": 0, "media": 0, "counters": 0, "own_comments": 0}
         return {
             "memories": await self.memories.purge_expired(),
             "profile_facts": await self.profiles.purge_expired_facts(),
             "media": await self.media.purge_expired(),
             "counters": await self.db.execute(
                 "DELETE FROM counters WHERE updated_at<?", (now() - 8 * 86400,)
+            ),
+            # 和「今天」页一样只看 30 天
+            "own_comments": await self.db.execute(
+                "DELETE FROM own_comments WHERE created_at<?", (now() - 31 * 86400,)
             ),
         }

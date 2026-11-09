@@ -12,7 +12,7 @@ import hashlib
 import json
 import re
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Iterable
 
 from ..security import Scope, readable_scopes
 from .db import Database, now
@@ -222,6 +222,20 @@ class SeenVideoStore:
             "SELECT * FROM seen_videos WHERE bvid=?", (key,)
         )
         return dict(row) if row is not None else None
+
+    async def forget(self, bvids: Iterable[str]) -> int:
+        """删除误记的观看痕迹；只用于修复从未真正观看过的条目。"""
+        keys = [key for key in (self.normalize_bvid(b) for b in bvids) if key]
+
+        def _forget(conn):
+            removed = 0
+            for key in keys:
+                removed += conn.execute(
+                    "DELETE FROM seen_videos WHERE bvid=?", (key,)
+                ).rowcount
+            return removed
+
+        return int(await self._db.run(_forget)) if keys else 0
 
     async def all_bvids(self) -> set[str]:
         rows = await self._db.fetch_all("SELECT bvid FROM seen_videos")
@@ -641,7 +655,7 @@ class MemoryStore:
 
     @staticmethod
     def _vector_blob(embedding: Any) -> tuple[int, bytes] | None:
-        if not isinstance(embedding, (list, tuple)) or not embedding:
+        if not isinstance(embedding, (list, tuple, array)) or not embedding:
             return None
         try:
             values = array("f", (float(value) for value in embedding))
@@ -650,15 +664,16 @@ class MemoryStore:
         return len(values), values.tobytes()
 
     @staticmethod
-    def _vector_list(blob: Any, dim: int) -> list[float]:
+    def _vector_list(blob: Any, dim: int) -> array:
+        """读出来就是 float32 数组，不展开成 Python 列表。"""
         if not blob or int(dim or 0) <= 0:
-            return []
+            return array("f")
         values = array("f")
         try:
             values.frombytes(bytes(blob))
         except (TypeError, ValueError):
-            return []
-        return list(values[: int(dim)])
+            return array("f")
+        return values[: int(dim)]
 
     @staticmethod
     def _legacy_payload(record: dict[str, Any]) -> dict[str, Any]:
@@ -710,6 +725,7 @@ class MemoryStore:
             "promoted_at": record.get("promoted_at_ts"),
             "bytes": len(content.encode("utf-8")),
             "vector": MemoryStore._vector_blob(record.get("embedding")),
+            "tags": sorted({str(t) for t in record.get("tags") or [] if isinstance(t, str) and t}),
             "vector_model": str(record.get("embedding_model") or "legacy"),
         }
 
@@ -757,8 +773,12 @@ class MemoryStore:
                 "dim=excluded.dim,vec=excluded.vec",
                 (memory_id, row["vector_model"], dim, blob),
             )
-        else:
-            conn.execute("DELETE FROM memory_vectors WHERE memory_id=?", (memory_id,))
+        # 没带向量的（json 里恢复的、平时导出不带向量）不动 sqlite 里已有的那份；记忆删了向量靠外键级联删
+        conn.execute("DELETE FROM memory_tags WHERE memory_id=?", (memory_id,))
+        conn.executemany(
+            "INSERT INTO memory_tags(memory_id,tag) VALUES(?,?)",
+            ((memory_id, tag) for tag in row.get("tags") or ()),
+        )
         return memory_id
 
     async def upsert_legacy(self, record: dict[str, Any]) -> int:
@@ -828,6 +848,16 @@ class MemoryStore:
                 record["embedding_model"] = str(row["vector_model"] or "legacy")
             result.append(record)
         return result
+
+    async def legacy_keys_with_tag(self, tag: str) -> list[str]:
+        """挂着这个标签的兼容记忆的 rpid，按时间先后。"""
+        rows = await self._db.fetch_all(
+            "SELECT lm.legacy_key FROM memory_tags t "
+            "JOIN legacy_memory_map lm ON lm.memory_id=t.memory_id "
+            "JOIN memories m ON m.id=t.memory_id WHERE t.tag=? ORDER BY m.created_at,m.id",
+            (tag,),
+        )
+        return [str(row["legacy_key"]) for row in rows]
 
     async def legacy_count(self) -> int:
         return int(
